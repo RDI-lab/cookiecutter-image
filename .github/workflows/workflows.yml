@@ -1,0 +1,153 @@
+name: Docker Image CI/CD
+
+on:
+  push:
+    branches: [ "*" ]
+    # Trigger on tags for releases
+    tags: [ 'v*.*.*' ]
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  # Use GitHub Container Registry
+  REGISTRY: ghcr.io
+  # github.repository as <account>/<repo>
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  lint-and-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Run hadolint on Dockerfile
+      - name: Lint Dockerfile
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+          failure-threshold: error
+
+      # Test Docker build to ensure Dockerfile is valid
+      - name: Test Docker Build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          load: true
+          tags: test-build:${{ github.sha }}
+
+  build-and-push:
+    needs: lint-and-validate
+    # Only run this job when pushing to main or creating a tag
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # Needed for changelog updates
+      packages: write  # Needed for GHCR push
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Fetch all history for changelog generation
+
+      # Setup QEMU for multi-platform builds
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      # Setup Docker Buildx for multi-platform builds
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Login to GitHub Container Registry
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Determine version for semantic versioning
+      - name: Determine version
+        id: version
+        run: |
+          if [[ $GITHUB_REF == refs/tags/v* ]]; then
+            # For tags, use the tag name without the 'v' prefix
+            VERSION=${GITHUB_REF#refs/tags/v}
+            echo "version=$VERSION" >> $GITHUB_OUTPUT
+            echo "tagged=true" >> $GITHUB_OUTPUT
+          else
+            # For non-tag pushes to main, use a date-based version
+            VERSION=$(date +'%Y.%m.%d')-$(git rev-parse --short HEAD)
+            echo "version=$VERSION" >> $GITHUB_OUTPUT
+            echo "tagged=false" >> $GITHUB_OUTPUT
+          fi
+
+      # Extract metadata for Docker
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=semver,pattern={{version}},value=${{ steps.version.outputs.version }},enable=${{ steps.version.outputs.tagged == 'true' }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ steps.version.outputs.version }},enable=${{ steps.version.outputs.tagged == 'true' }}
+            type=semver,pattern={{major}},value=${{ steps.version.outputs.version }},enable=${{ steps.version.outputs.tagged == 'true' }}
+            type=raw,value=${{ steps.version.outputs.version }},enable=${{ steps.version.outputs.tagged == 'false' }}
+
+      # Build and push Docker image
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Update Changelog if this is a tagged release
+      - name: Update Changelog
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          # Extract version from tag
+          VERSION=${GITHUB_REF#refs/tags/v}
+
+          # Get commit messages since last tag
+          if git describe --abbrev=0 --tags HEAD^ 2>/dev/null; then
+            PREV_TAG=$(git describe --abbrev=0 --tags HEAD^)
+            RANGE="$PREV_TAG..HEAD"
+          else
+            # First tag case
+            RANGE="$(git rev-list --max-parents=0 HEAD)..HEAD"
+          fi
+
+          # Generate changelog content
+          echo -e "# $VERSION ($(date +%Y-%m-%d))\n" > temp_changelog.md
+
+          # Add sections for different types of changes
+          echo -e "## Features\n" >> temp_changelog.md
+          git log $RANGE --pretty=format:"* %s" --grep="^feat" >> temp_changelog.md
+          echo -e "\n\n## Bug Fixes\n" >> temp_changelog.md
+          git log $RANGE --pretty=format:"* %s" --grep="^fix" >> temp_changelog.md
+          echo -e "\n\n## Other Changes\n" >> temp_changelog.md
+          git log $RANGE --pretty=format:"* %s" | grep -v "^feat" | grep -v "^fix" >> temp_changelog.md
+          echo -e "\n\n" >> temp_changelog.md
+
+          # Prepend to existing changelog or create new one
+          if [ -f CHANGELOG.md ]; then
+            cat CHANGELOG.md >> temp_changelog.md
+            mv temp_changelog.md CHANGELOG.md
+          else
+            mv temp_changelog.md CHANGELOG.md
+          fi
+
+          # Commit and push the changelog update
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add CHANGELOG.md
+          git commit -m "chore: update changelog for $VERSION [skip ci]"
+          git push
